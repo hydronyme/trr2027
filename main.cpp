@@ -70,16 +70,17 @@
 class CameraAnalysis {
 public:
   CameraAnalysis()
-      : param_canny_min_(150), param_canny_max_(200), width(1280), height(720),
-        vh_(200), u0_(640), beta_x_(0.13646387832699614),
-        beta_y_(67.19999999999997) {
-    initVPI();
+      : param_canny_min(150), param_canny_max(200), width(1280), height(720),
+        vh(200), u0(640), beta_x(0.13646387832699614),
+        beta_y(67.19999999999997) {
+    init();
   }
 
   ~CameraAnalysis() {
     if (stream) vpiStreamDestroy(stream);
           gst_element_set_state(pipeline, GST_STATE_NULL);
           gst_object_unref(pipeline);
+    delete[] h_init; // Libère l'initialisation temporaire
     // if (payload_eq) vpiStreamDestroy(payload_eq);
     // if (payload_canny) vpiStreamDestroy(payload_canny);
   }
@@ -98,6 +99,15 @@ public:
   int64 timer_6 = 0;
 
 private:
+  void init() {
+    init_gstreamer();
+    CHECK_CUDA_STATUS(cudaStreamCreate(&cudaStream));
+    CHECK_VPI(vpiStreamCreateWrapperCUDA(cudaStream, 0, &stream));
+    allocateMemoryForPreTreatment();
+    CHECK_CUDA_STATUS(cudaMalloc(&d_result, height * sizeof(int))); // Alloue sur le GPU
+    CHECK_CUDA_STATUS(cudaMemcpy(d_result, h_init, height * sizeof(int), cudaMemcpyHostToDevice));
+  }
+
  int init_gstreamer() {
 
           // const std::string filename = "./road/cam_2974997494746.jpg";
@@ -131,9 +141,7 @@ private:
           if (!pipeline) {
             std::cerr << "Impossible de créer le pipeline" << std::endl;
             if (error) {
-                std::cerr << "GStreamer : "
-                          << error->message
-                          << std::endl;
+                std::cerr << "GStreamer : " << error->message << std::endl;
                 g_error_free(error);
             }
             return -1;
@@ -144,28 +152,18 @@ private:
             gst_object_unref(pipeline);
             return -1;
         }
-          g_signal_connect( appsink, "new-sample", G_CALLBACK(CameraAnalysis::onNewSample), this);
+          g_signal_connect(appsink, "new-sample", G_CALLBACK(CameraAnalysis::onNewImage), this);
           return 0;
   }
 
-  void initVPI() {
-    init_gstreamer();
+  void allocateMemoryForPreTreatment() {
 
-    CHECK_CUDA_STATUS(cudaStreamCreate(&cudaStream));
-    CHECK_VPI(vpiStreamCreateWrapperCUDA(cudaStream, 0, &stream));
-    vpiCreateEqualizeHist(VPI_BACKEND_CUDA, VPI_IMAGE_FORMAT_U8, &payload_eq);
-    vpiCreateCannyEdgeDetector(VPI_BACKEND_CUDA, width, height, &payload_canny);
-    vpiInitCannyEdgeDetectorParams(&canny_params);
-
-    // Allocate pointers to be wrapped and create wrapped images
-    vpiInitImageWrapperParams(&params);
     wrapParams.colorSpec = VPI_COLOR_SPEC_DEFAULT;
 
-    cudaMalloc(&d_result, height * sizeof(int)); // Alloue sur le GPU
-
-    // Optionnel : initialise d_result avec des zéros (si nécessaire)
-    cudaMemcpy(d_result, h_init, height * sizeof(int), cudaMemcpyHostToDevice);
-    // delete[] h_init; // Libère l'initialisation temporaire
+    // Allocate payloads
+    CHECK_VPI(vpiCreateEqualizeHist(VPI_BACKEND_CUDA, VPI_IMAGE_FORMAT_U8, &payload_eq));
+    CHECK_VPI(vpiCreateCannyEdgeDetector(VPI_BACKEND_CUDA, width, height, &payload_canny));
+    CHECK_VPI(vpiInitCannyEdgeDetectorParams(&canny_params));
 
     // Allocate CUDA pitch
     CHECK_CUDA_STATUS(cudaMalloc(&cudaGray, width * height * sizeof(uint8_t)));
@@ -173,25 +171,16 @@ private:
     CHECK_CUDA_STATUS(cudaMalloc(&cudaEq, width * height * sizeof(uint8_t)));
     CHECK_CUDA_STATUS(cudaMalloc(&cudaCanny, width * height * sizeof(uint8_t)));
 
-    // Alloue avec pitch
-    /*
-    size_t pitch;
-    CHECK_CUDA_STATUS(cudaMallocPitch(&cudaGray, &pitch, width * sizeof(uint8_t), height)); 
-    CHECK_CUDA_STATUS(cudaMallocPitch(&cudaBlur, &pitch, width * sizeof(uint8_t), height));
-    CHECK_CUDA_STATUS(cudaMallocPitch(&cudaEq, &pitch, width * sizeof(uint8_t), height)); 
-    CHECK_CUDA_STATUS(cudaMallocPitch(&cudaCanny, &pitch, width * sizeof(uint8_t), height));
-    */
-
     // Wrap CUDA pitches directly in VPIImage
-    VPIImageData dataGray = GetGenericPLData( width, height, VPI_IMAGE_BUFFER_CUDA_PITCH_LINEAR, cudaGray);
-    VPIImageData dataBlur = GetGenericPLData( width, height, VPI_IMAGE_BUFFER_CUDA_PITCH_LINEAR, cudaBlur);
-    VPIImageData dataEq = GetGenericPLData( width, height, VPI_IMAGE_BUFFER_CUDA_PITCH_LINEAR, cudaEq);
+    VPIImageData dataGray  = GetGenericPLData( width, height, VPI_IMAGE_BUFFER_CUDA_PITCH_LINEAR, cudaGray);
+    VPIImageData dataBlur  = GetGenericPLData( width, height, VPI_IMAGE_BUFFER_CUDA_PITCH_LINEAR, cudaBlur);
+    VPIImageData dataEq    = GetGenericPLData( width, height, VPI_IMAGE_BUFFER_CUDA_PITCH_LINEAR, cudaEq);
     VPIImageData dataCanny = GetGenericPLData( width, height, VPI_IMAGE_BUFFER_CUDA_PITCH_LINEAR, cudaCanny);
 
-    // 1. Allocation d'une image VPI forcée en mémoire Device CUDA
+    // Allocation d'une image VPI forcée en mémoire Device CUDA
     CHECK_VPI(vpiImageCreateWrapper(&dataGray, &wrapParams, VPI_BACKEND_CUDA, &vpiGray));
     CHECK_VPI(vpiImageCreateWrapper(&dataBlur, &wrapParams, VPI_BACKEND_CUDA, &vpiBlur));
-    CHECK_VPI( vpiImageCreateWrapper(&dataEq, &wrapParams, VPI_BACKEND_CUDA, &vpiEq));
+    CHECK_VPI(vpiImageCreateWrapper(&dataEq, &wrapParams, VPI_BACKEND_CUDA, &vpiEq));
     CHECK_VPI(vpiImageCreateWrapper(&dataCanny, &wrapParams, VPI_BACKEND_CUDA, &vpiCanny));
   }
 
@@ -211,24 +200,9 @@ private:
     return vpiImgData;
   }
 
-  struct TargetResult {
-    int u = -1;
-    int v = 0;
-    double x = 0.0;
-    double y = 0.0;
-    bool found = false;
-  };
+  static GstFlowReturn onNewImage(GstAppSink* appsink, gpointer user_data);
 
-  void writeCudaImg(uint8_t *cudaData,std::string file) {
-    cv::Mat img(height, width, CV_8UC1);
-    std::cout << "toto" << '\n';
-    CHECK_CUDA_STATUS(cudaMemcpy(img.data, cudaData, width * height * sizeof(uint8_t), cudaMemcpyDeviceToHost)); 
-    cv::imwrite(file, img);
-  }
-
-  static GstFlowReturn onNewSample(GstAppSink* appsink, gpointer user_data);
-
-  bool createVPIImageDataFromGstBuffer(GstBuffer *gstBuffer,GstCaps *caps) {
+  bool analyse_image(GstBuffer *gstBuffer,GstCaps *caps) {
     timer_1= cv::getTickCount();
     nb_loop++;
     GstMapInfo map = GST_MAP_INFO_INIT;
@@ -238,7 +212,7 @@ private:
     CHECK_VPI(vpiImageCreateWrapper(&dataGray, &wrapParams, VPI_BACKEND_CUDA, &vpiGray));
     CHECK_VPI(vpiSubmitBoxFilter(stream, VPI_BACKEND_CUDA, vpiGray, vpiBlur, 5, 5, VPI_BORDER_ZERO));
     CHECK_VPI(vpiSubmitEqualizeHist(stream, VPI_BACKEND_CUDA, payload_eq, vpiBlur, vpiEq));
-    CHECK_VPI(vpiSubmitCannyEdgeDetector(stream, VPI_BACKEND_CUDA, payload_canny, vpiEq, vpiCanny, param_canny_max_, param_canny_min_, 255, 0, &canny_params));
+    CHECK_VPI(vpiSubmitCannyEdgeDetector(stream, VPI_BACKEND_CUDA, payload_canny, vpiEq, vpiCanny, param_canny_max, param_canny_min, 255, 0, &canny_params));
     timer_3= cv::getTickCount();
     submitLineAnalysis(cudaEq, cudaCanny, width, height, cudaStream, d_result);
     CHECK_VPI(vpiStreamSync(stream));
@@ -254,27 +228,7 @@ private:
     }
     std::cout << "R:" << count << " points" << '\n';
     //std::cout << std::endl;
-    if (nb_loop==22) {
-        writeCudaImg(cudaCanny,"canny.png"); 
-        writeCudaImg(cudaEq,"eq.png"); 
-
-        cv::Mat imgGray( height, width, CV_8UC1, map.data, width);
-        cv::imwrite("gray.png", imgGray);
-
-        cv::Mat img;
-        cv::Mat nv12( height + height / 2, width, CV_8UC1, map.data, width);
-        cv::cvtColor(nv12, img, cv::COLOR_YUV2BGR_NV12);
-        for (int i = 0; i < 720; i++) {
-          if(h_result[i]!=-1) 
-          {
-            count++;
-            //std::cout << "R" << i << " " << h_result[i] << ' ';
-            cv::circle(img, cv::Point(h_result[i],i), 3, cv::Scalar( 255, 0, 0 ),cv::FILLED,cv::LINE_8);
-          }
-        }
-        cv::imwrite("nv12.png", img);
-
-    }
+    if (nb_loop==22) export_image(map); 
     gst_buffer_unmap(gstBuffer, &map);
 
     timer_5= cv::getTickCount();
@@ -290,15 +244,42 @@ private:
     return true;
   }
 
-  int param_canny_min_;
-  int param_canny_max_;
+  void export_image(GstMapInfo map) {
+        writeCudaImg(cudaCanny,"canny.png"); 
+        writeCudaImg(cudaEq,"eq.png"); 
+
+        cv::Mat imgGray( height, width, CV_8UC1, map.data, width);
+        cv::imwrite("gray.png", imgGray);
+
+        cv::Mat img;
+        cv::Mat nv12( height + height / 2, width, CV_8UC1, map.data, width);
+        cv::cvtColor(nv12, img, cv::COLOR_YUV2BGR_NV12);
+        int count;
+        for (int i = 0; i < 720; i++) {
+          if(h_result[i]!=-1) 
+          {
+            count++;
+            //std::cout << "R" << i << " " << h_result[i] << ' ';
+            cv::circle(img, cv::Point(h_result[i],i), 3, cv::Scalar( 255, 0, 0 ),cv::FILLED,cv::LINE_8);
+          }
+        }
+        cv::imwrite("nv12.png", img);
+  }
+
+  void writeCudaImg(uint8_t *cudaData,std::string file) {
+    cv::Mat img(height, width, CV_8UC1);
+    CHECK_CUDA_STATUS(cudaMemcpy(img.data, cudaData, width * height * sizeof(uint8_t), cudaMemcpyDeviceToHost)); 
+    cv::imwrite(file, img);
+  }
+
+  int param_canny_min;
+  int param_canny_max;
   int width;
   int height;
-  int vh_;
-  int u0_;
-  double beta_x_;
-  double beta_y_;
-
+  int vh;
+  int u0;
+  double beta_x;
+  double beta_y;
   int nb_loop;
 
   GstElement *pipeline = nullptr;
@@ -311,11 +292,15 @@ private:
   VPIPayload payload_canny;
   VPICannyEdgeDetectorParams canny_params;
 
-  cv::Mat img;
-  VPIImage vpiGray = nullptr, vpiCanny = nullptr;
-  VPIImage vpiBlur = nullptr, vpiEq = nullptr;
-  uint8_t *cudaGray = nullptr, *cudaCanny = nullptr;
-  uint8_t *cudaBlur = nullptr, *cudaEq = nullptr;
+  VPIImage vpiGray = nullptr;
+  VPIImage vpiCanny = nullptr;
+  VPIImage vpiBlur = nullptr;
+  VPIImage vpiEq = nullptr;
+
+  uint8_t *cudaGray = nullptr;
+  uint8_t *cudaCanny = nullptr;
+  uint8_t *cudaBlur = nullptr;
+  uint8_t *cudaEq = nullptr;
 
   VPIImageData dataGray;
   VPIImageData dataBlur;
@@ -323,7 +308,6 @@ private:
   VPIImageData dataCanny;
 
   VPIImageWrapperParams wrapParams = {};
-  VPIImageWrapperParams params;
 
   int *h_result = new int[height]; // Alloue sur le CPU
   int *h_init = new int[height](); // Rempli de zéros
@@ -337,8 +321,7 @@ private:
 /*    fin de la classe                 */
 /***************************************/
 
-GstFlowReturn CameraAnalysis::onNewSample( GstAppSink* appsink, gpointer user_data) {
-
+GstFlowReturn CameraAnalysis::onNewImage(GstAppSink* appsink, gpointer user_data) {
     auto* camera = static_cast<CameraAnalysis*>(user_data);
     camera->timer_0 = cv::getTickCount();
     GstSample* sample = gst_app_sink_pull_sample(appsink);
@@ -350,7 +333,7 @@ GstFlowReturn CameraAnalysis::onNewSample( GstAppSink* appsink, gpointer user_da
         return GST_FLOW_ERROR;
     }
     GstCaps *caps = gst_sample_get_caps(sample);
-    camera->createVPIImageDataFromGstBuffer(buffer,caps);
+    camera->analyse_image(buffer,caps);
     return GST_FLOW_OK;
 }
 
